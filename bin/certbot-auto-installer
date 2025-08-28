@@ -1,0 +1,179 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# Resolve repository root to source lib files regardless of cwd
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." >/dev/null 2>&1 && pwd)"
+# shellcheck source=lib/common.sh
+. "${REPO_ROOT}/lib/common.sh"
+
+VERSION="1.0.0"
+
+usage() {
+  cat <<'USAGE'
+certbot-auto-installer — Install, manage, and renew Let's Encrypt certificates with Certbot.
+
+Usage:
+  certbot-auto-installer [command] [options]
+
+Commands:
+  install                       Install certbot and optional webserver plugin
+  list                          List existing certificates
+  detect                        Detect OS, package manager, and active webserver
+  obtain [--dns|--http] -d DOMAIN [-w WEBROOT]
+                                Obtain a new certificate via DNS or HTTP challenge
+  renew [-d DOMAIN|--all]       Renew a specific certificate or all due certificates
+  auto-renew [enable|disable|status]
+                                Manage system auto-renewal (systemd timer if available)
+  version                       Print version
+  help                          Show this help
+
+Options:
+  -y                            Assume yes (non-interactive) where applicable
+  --dry-run                     Use certbot --dry-run for obtain/renew
+  -v, --verbose                 Enable verbose logging
+
+Examples:
+  certbot-auto-installer install
+  certbot-auto-installer obtain --http -d example.com -w /var/www/html
+  certbot-auto-installer obtain --dns -d example.com
+  certbot-auto-installer renew --all
+  certbot-auto-installer auto-renew enable
+USAGE
+}
+
+require_tools() {
+  for t in awk sed grep; do
+    command_exists "$t" || die "Missing required tool: $t"
+  done
+}
+
+cmd_detect() {
+  info "Detecting environment..."
+  detect_os; echo "OS: $OS_NAME $OS_VERSION";
+  detect_pkg_manager; echo "Package manager: $PKG_MGR";
+  detect_webserver || true; echo "Webserver: ${WEBSERVER:-none}"
+}
+
+cmd_install() {
+  require_tools
+  detect_pkg_manager
+  info "Installing certbot..."
+  install_certbot
+  detect_webserver || true
+  if [[ -n "${WEBSERVER:-}" ]]; then
+    info "Installing certbot plugin for $WEBSERVER..."
+    install_certbot_plugin "$WEBSERVER" || warn "Failed to install plugin for $WEBSERVER"
+  else
+    warn "No active webserver detected. Skipping plugin install."
+  fi
+  success "Installation complete."
+}
+
+cmd_list() {
+  require_certbot
+  info "Listing certificates..."
+  if ! sudo_if_needed certbot certificates; then
+    warn "No certificates found or certbot unavailable."
+  fi
+}
+
+cmd_obtain() {
+  require_certbot
+  local method="" domain="" webroot="" dryrun=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dns) method="dns"; shift ;;
+      --http) method="http"; shift ;;
+      -d) domain="$2"; shift 2 ;;
+      -w) webroot="$2"; shift 2 ;;
+      --dry-run) dryrun="--dry-run"; shift ;;
+      -y) ASSUME_YES=1; shift ;;
+      -v|--verbose) VERBOSE=1; shift ;;
+      *) die "Unknown option for obtain: $1" ;;
+    esac
+  done
+  [[ -n "$domain" ]] || die "Domain is required. Use -d DOMAIN"
+  [[ -n "$method" ]] || die "Choose a method: --dns or --http"
+
+  case "$method" in
+    dns)
+      info "Requesting DNS challenge for $domain"
+      sudo_if_needed certbot certonly --manual --preferred-challenges dns -d "$domain" \
+        --agree-tos --no-eff-email --manual-public-ip-logging-ok ${dryrun}
+      ;;
+    http)
+      [[ -n "$webroot" ]] || die "HTTP method requires -w WEBROOT"
+      info "Requesting HTTP challenge for $domain using webroot $webroot"
+      sudo_if_needed certbot certonly --webroot -w "$webroot" -d "$domain" \
+        --agree-tos --no-eff-email ${dryrun}
+      ;;
+  esac
+  success "Certificate request finished for $domain"
+}
+
+cmd_renew() {
+  require_certbot
+  local domain="" all="" dryrun=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -d) domain="$2"; shift 2 ;;
+      --all) all=1; shift ;;
+      --dry-run) dryrun="--dry-run"; shift ;;
+      -y) ASSUME_YES=1; shift ;;
+      -v|--verbose) VERBOSE=1; shift ;;
+      *) die "Unknown option for renew: $1" ;;
+    esac
+  done
+  if [[ -n "$domain" ]]; then
+    info "Renewing certificate: $domain"
+    sudo_if_needed certbot renew --cert-name "$domain" ${dryrun}
+  else
+    [[ -n "$all" ]] || die "Specify -d DOMAIN or --all"
+    info "Renewing all due certificates"
+    sudo_if_needed certbot renew ${dryrun}
+  fi
+  success "Renew completed"
+}
+
+cmd_auto_renew() {
+  local action="${1:-status}"
+  shift || true
+  case "$action" in
+    enable)
+      enable_auto_renew
+      ;;
+    disable)
+      disable_auto_renew
+      ;;
+    status)
+      auto_renew_status
+      ;;
+    *) die "Unknown auto-renew action: $action" ;;
+  esac
+}
+
+cmd_version() {
+  echo "$VERSION"
+}
+
+main() {
+  [[ $# -gt 0 ]] || { usage; exit 0; }
+
+  local cmd="$1"; shift || true
+  case "$cmd" in
+    help|-h|--help) usage ;;
+    version|--version|-V) cmd_version ;;
+    detect) cmd_detect ;;
+    install) cmd_install ;;
+    list) cmd_list ;;
+    obtain) cmd_obtain "$@" ;;
+    renew) cmd_renew "$@" ;;
+    auto-renew) cmd_auto_renew "$@" ;;
+    *) error "Unknown command: $cmd"; echo; usage; exit 1 ;;
+  esac
+}
+
+main "$@"
+
